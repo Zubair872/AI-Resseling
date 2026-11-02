@@ -1,7 +1,6 @@
-import { readFile } from 'node:fs/promises'
-import { query, closeDatabase } from './db.js'
+import { closeDatabase } from './db.js'
+import { applyMigration } from './migration.js'
 
-const migration = await readFile(new URL('../db/001_initial.sql', import.meta.url), 'utf8')
-await query(migration)
+await applyMigration()
 await closeDatabase()
 console.log('Database migration applied')

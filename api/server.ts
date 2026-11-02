@@ -4,15 +4,16 @@ import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import { z } from 'zod'
 import { config } from './config.js'
-import { comparePassword, hashPassword, signToken, verifyToken, type AuthUser } from './auth.js'
+import { comparePassword, createRefreshToken, hashPassword, hashRefreshToken, signToken, verifyToken, type AuthUser } from './auth.js'
 import { query } from './db.js'
 import { calculatePrice } from './pricing.js'
-import { getContentProvider } from './ai.js'
+import { AIProviderError, getContentProvider } from './ai.js'
 import { AuthorizationRequiredSupplier, ManualPaymentProvider } from './providers.js'
 import { enqueueWorkflow } from './queue.js'
 import { parseProductCsv, type ProductImportRow } from './csv.js'
 import { requireRole } from './permissions.js'
 import { writeAuditLog } from './audit.js'
+import { applyMigration } from './migration.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -26,6 +27,7 @@ await app.register(helmet)
 await app.register(rateLimit, { max: 120, timeWindow: '1 minute' })
 
 const credentialsSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(128) })
+const refreshSchema = z.object({ refreshToken: z.string().min(40).max(200) })
 const productSchema = z.object({
   name: z.string().min(2).max(180),
   description: z.string().max(10000).optional(),
@@ -49,6 +51,9 @@ const contentSchema = z.object({ productId: z.string().uuid().optional(), produc
 const socialAccountSchema = z.object({ platform: z.enum(['facebook', 'instagram', 'tiktok', 'whatsapp']), displayName: z.string().min(2).max(160), externalAccountId: z.string().max(180).optional() })
 const paymentSchema = z.object({ orderId: z.string().uuid(), method: z.enum(['bank_transfer', 'easypaisa', 'jazzcash', 'other']), amount: z.number().positive(), reference: z.string().max(180).optional(), proofUrl: z.string().url().optional() })
 const supplierSchema = z.object({ orderId: z.string().uuid(), supplierKind: z.enum(['markaz', 'hhc', 'aliexpress', 'temu', 'daraz']) })
+const decisionSchema = z.object({ decision: z.enum(['approved', 'rejected']) })
+const conversationSchema = z.object({ customer: z.object({ name: z.string().min(2).max(160), phone: z.string().min(7).max(40), city: z.string().max(100).optional(), address: z.string().max(500).optional() }), channel: z.enum(['manual', 'whatsapp', 'instagram', 'facebook', 'email']).default('manual') })
+const messageSchema = z.object({ body: z.string().min(1).max(10000), direction: z.enum(['inbound', 'outbound']).default('inbound'), status: z.enum(['draft', 'approved', 'sent']).default('draft') })
 const publishSchema = z.object({ contentDraftId: z.string().uuid(), socialAccountId: z.string().uuid(), scheduledFor: z.string().datetime() })
 const jobSchema = z.object({ jobType: z.enum(['product-import', 'content-generation', 'publishing', 'supplier-order', 'notification']), resourceId: z.string().uuid().optional(), payload: z.record(z.string(), z.unknown()).optional(), idempotencyKey: z.string().min(8).max(180) })
 
@@ -83,7 +88,12 @@ app.post('/api/auth/register', async (request, reply) => {
     )
     await client.query('COMMIT')
     const authUser: AuthUser = { id: user.rows[0].id, tenantId: tenant.rows[0].id, email: email.toLowerCase(), role: user.rows[0].role }
-    return reply.code(201).send({ user: authUser, token: signToken(authUser) })
+    const refreshToken = createRefreshToken()
+    await query(
+      'INSERT INTO refresh_sessions (user_id, tenant_id, token_hash, expires_at) VALUES ($1,$2,$3,now() + interval \'30 days\')',
+      [authUser.id, authUser.tenantId, hashRefreshToken(refreshToken)],
+    )
+    return reply.code(201).send({ user: authUser, token: signToken(authUser), refreshToken })
   } catch (error: unknown) {
     await client.query('ROLLBACK')
     if (error instanceof Error && error.message.includes('users_email_key')) return reply.code(409).send({ error: 'Email is already registered' })
@@ -104,7 +114,37 @@ app.post('/api/auth/login', async (request, reply) => {
   const row = result.rows[0]
   if (!row || !(await comparePassword(parsed.data.password, row.password_hash))) return reply.code(401).send({ error: 'Email or password is incorrect' })
   const user: AuthUser = { id: row.id, tenantId: row.tenant_id, email: row.email, role: row.role }
-  return { user, token: signToken(user) }
+  const refreshToken = createRefreshToken()
+  await query(
+    'INSERT INTO refresh_sessions (user_id, tenant_id, token_hash, expires_at) VALUES ($1,$2,$3,now() + interval \'30 days\')',
+    [user.id, user.tenantId, hashRefreshToken(refreshToken)],
+  )
+  return { user, token: signToken(user), refreshToken }
+})
+
+app.post('/api/auth/refresh', async (request, reply) => {
+  const parsed = refreshSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(401).send({ error: 'Invalid refresh session' })
+  const currentHash = hashRefreshToken(parsed.data.refreshToken)
+  const result = await query<{ id: string; user_id: string; tenant_id: string; email: string; role: string }>(
+    'SELECT r.id, r.user_id, r.tenant_id, u.email, u.role FROM refresh_sessions r JOIN users u ON u.id = r.user_id WHERE r.token_hash = $1 AND r.revoked_at IS NULL AND r.expires_at > now() AND u.is_active = true',
+    [currentHash],
+  )
+  const session = result.rows[0]
+  if (!session) return reply.code(401).send({ error: 'Refresh session expired. Please sign in again.' })
+  const nextRefreshToken = createRefreshToken()
+  await query('UPDATE refresh_sessions SET revoked_at = now() WHERE id = $1', [session.id])
+  await query(
+    'INSERT INTO refresh_sessions (user_id, tenant_id, token_hash, expires_at) VALUES ($1,$2,$3,now() + interval \'30 days\')',
+    [session.user_id, session.tenant_id, hashRefreshToken(nextRefreshToken)],
+  )
+  const user: AuthUser = { id: session.user_id, tenantId: session.tenant_id, email: session.email, role: session.role }
+  return { user, token: signToken(user), refreshToken: nextRefreshToken }
+})
+
+app.post('/api/auth/logout', { preHandler: requireAuth }, async (request) => {
+  await query('UPDATE refresh_sessions SET revoked_at = now() WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL', [request.user!.id, request.user!.tenantId])
+  return { success: true }
 })
 
 app.get('/api/me', { preHandler: requireAuth }, async (request) => ({ user: request.user }))
@@ -267,8 +307,17 @@ app.get('/api/plans', async () => {
 
 app.get('/api/subscription', { preHandler: requireAuth }, async (request, reply) => {
   const result = await query(
-    'SELECT s.status, s.billing_cycle, s.current_period_end, p.code, p.name, p.product_limit, p.social_account_limit, p.ai_action_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.tenant_id = $1',
-    [request.user!.tenantId],
+    `SELECT s.status, s.billing_cycle, s.current_period_end, p.code, p.name,
+      p.product_limit, p.social_account_limit, p.ai_action_limit,
+      COALESCE((
+        SELECT SUM(quantity)::int FROM usage_events
+        WHERE tenant_id = s.tenant_id AND kind = $2
+        AND created_at >= date_trunc('month', now())
+      ), 0)::int AS used_ai_actions
+     FROM subscriptions s
+     JOIN plans p ON p.id = s.plan_id
+     WHERE s.tenant_id = $1`,
+    [request.user!.tenantId, 'ai_content_generation'],
   )
   if (!result.rows[0]) return reply.code(404).send({ error: 'No subscription configured' })
   return { subscription: result.rows[0] }
@@ -277,6 +326,23 @@ app.get('/api/subscription', { preHandler: requireAuth }, async (request, reply)
 app.post('/api/content/generate', { preHandler: requireAuth }, async (request, reply) => {
   const parsed = contentSchema.safeParse(request.body)
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid content request', details: parsed.error.flatten() })
+  const allowance = await query<{ ai_action_limit: number; used_actions: number }>(
+    `SELECT p.ai_action_limit,
+      (SELECT COALESCE(SUM(quantity), 0)::int FROM usage_events
+       WHERE tenant_id = s.tenant_id AND kind = $2
+       AND created_at >= date_trunc('month', now())) AS used_actions
+     FROM subscriptions s
+     JOIN plans p ON p.id = s.plan_id
+     WHERE s.tenant_id = $1 AND s.status IN ('trialing', 'active')`,
+    [request.user!.tenantId, 'ai_content_generation'],
+  )
+  if (!allowance.rows[0]) return reply.code(409).send({ error: 'No active subscription is configured for this workspace' })
+  if (allowance.rows[0].used_actions >= allowance.rows[0].ai_action_limit) {
+    return reply.code(429).send({
+      error: 'Monthly AI action limit reached',
+      usage: { used: allowance.rows[0].used_actions, limit: allowance.rows[0].ai_action_limit },
+    })
+  }
   const provider = getContentProvider()
   const content = await provider.generate(parsed.data)
   const result = await query(
@@ -303,6 +369,26 @@ app.post('/api/workflows/enqueue', { preHandler: requireAuth }, async (request, 
 app.get('/api/content/drafts', { preHandler: requireAuth }, async (request) => {
   const result = await query('SELECT id, product_id, platform, language, content, status, created_at FROM content_drafts WHERE tenant_id = $1 ORDER BY created_at DESC', [request.user!.tenantId])
   return { drafts: result.rows }
+})
+
+app.post('/api/content/drafts/:id/decision', { preHandler: [requireAuth, requireRole('manager')] }, async (request, reply) => {
+  const parsed = decisionSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid content draft decision', details: parsed.error.flatten() })
+  const params = request.params as { id: string }
+  const result = await query(
+    'UPDATE content_drafts SET status = $1, reviewed_by = $2, reviewed_at = now() WHERE id = $3 AND tenant_id = $4 AND status = $5 RETURNING id, product_id, platform, language, content, status, created_at',
+    [parsed.data.decision, request.user!.id, params.id, request.user!.tenantId, 'draft'],
+  )
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Draft not found or already reviewed' })
+  await writeAuditLog({
+    tenantId: request.user!.tenantId,
+    userId: request.user!.id,
+    action: `content_draft.${parsed.data.decision}`,
+    entityType: 'content_draft',
+    entityId: params.id,
+    metadata: { status: parsed.data.decision },
+  })
+  return { draft: result.rows[0] }
 })
 
 app.get('/api/social-accounts', { preHandler: requireAuth }, async (request) => {
@@ -334,6 +420,26 @@ app.post('/api/payments/verification-requests', { preHandler: requireAuth }, asy
   return reply.code(201).send({ verification: result.rows[0], note: 'Payment remains pending until human verification.' })
 })
 
+app.get('/api/payments/verification-requests', { preHandler: requireAuth }, async (request) => {
+  const result = await query(
+    'SELECT v.id, v.order_id, v.method, v.amount, v.reference, v.proof_url, v.status, v.reviewed_at, v.created_at, c.name AS customer_name FROM payment_verifications v JOIN orders o ON o.id = v.order_id JOIN customers c ON c.id = o.customer_id WHERE v.tenant_id = $1 ORDER BY v.created_at DESC',
+    [request.user!.tenantId],
+  )
+  return { verifications: result.rows }
+})
+
+app.post('/api/payments/verification-requests/:id/decision', { preHandler: [requireAuth, requireRole('manager')] }, async (request, reply) => {
+  const parsed = decisionSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid payment decision' })
+  const result = await query<{ id: string; order_id: string; status: string }>(
+    'UPDATE payment_verifications SET status = $1, reviewed_by = $2, reviewed_at = now() WHERE id = $3 AND tenant_id = $4 AND status = $5 RETURNING id, order_id, status',
+    [parsed.data.decision, request.user!.id, request.params && (request.params as { id: string }).id, request.user!.tenantId, 'pending'],
+  )
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Pending payment verification not found' })
+  await writeAuditLog({ tenantId: request.user!.tenantId, userId: request.user!.id, action: `payment.${parsed.data.decision}`, entityType: 'payment_verification', entityId: result.rows[0].id, metadata: { orderId: result.rows[0].order_id } })
+  return { verification: result.rows[0] }
+})
+
 app.post('/api/supplier-orders', { preHandler: requireAuth }, async (request, reply) => {
   const parsed = supplierSchema.safeParse(request.body)
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid supplier order data', details: parsed.error.flatten() })
@@ -346,6 +452,71 @@ app.post('/api/supplier-orders', { preHandler: requireAuth }, async (request, re
     [request.user!.tenantId, parsed.data.orderId, parsed.data.supplierKind, submission.status],
   )
   return reply.code(201).send({ supplierOrder: result.rows[0], note: 'Supplier submission requires an approved adapter and authorization.' })
+})
+
+app.get('/api/supplier-orders', { preHandler: requireAuth }, async (request) => {
+  const result = await query(
+    'SELECT s.id, s.order_id, s.supplier_kind, s.supplier_order_id, s.status, s.error_message, s.created_at, c.name AS customer_name, p.name AS product_name FROM supplier_orders s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id JOIN products p ON p.id = o.product_id WHERE s.tenant_id = $1 ORDER BY s.created_at DESC',
+    [request.user!.tenantId],
+  )
+  return { supplierOrders: result.rows }
+})
+
+app.post('/api/supplier-orders/:id/decision', { preHandler: [requireAuth, requireRole('manager')] }, async (request, reply) => {
+  const parsed = decisionSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid supplier decision' })
+  const status = parsed.data.decision === 'approved' ? 'approved_manual_review' : 'rejected'
+  const result = await query<{ id: string; order_id: string; status: string }>(
+    'UPDATE supplier_orders SET status = $1 WHERE id = $2 AND tenant_id = $3 AND status = $4 RETURNING id, order_id, status',
+    [status, request.params && (request.params as { id: string }).id, request.user!.tenantId, 'pending_authorization'],
+  )
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Pending supplier order not found' })
+  await writeAuditLog({ tenantId: request.user!.tenantId, userId: request.user!.id, action: `supplier.${parsed.data.decision}`, entityType: 'supplier_order', entityId: result.rows[0].id, metadata: { orderId: result.rows[0].order_id, externalOrderPlaced: false } })
+  return { supplierOrder: result.rows[0], note: 'Approval records human intent only; no external supplier order was placed.' }
+})
+
+app.get('/api/conversations', { preHandler: requireAuth }, async (request) => {
+  const result = await query(
+    'SELECT c.id, c.channel, c.status, c.created_at, c.updated_at, u.name AS customer_name, u.phone, (SELECT body FROM conversation_messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message FROM conversations c JOIN customers u ON u.id = c.customer_id WHERE c.tenant_id = $1 ORDER BY c.updated_at DESC',
+    [request.user!.tenantId],
+  )
+  return { conversations: result.rows }
+})
+
+app.post('/api/conversations', { preHandler: requireAuth }, async (request, reply) => {
+  const parsed = conversationSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid conversation data' })
+  const customer = await query<{ id: string }>(
+    'INSERT INTO customers (tenant_id, name, phone, city, address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant_id, phone) DO UPDATE SET name = EXCLUDED.name, city = EXCLUDED.city, address = EXCLUDED.address RETURNING id',
+    [request.user!.tenantId, parsed.data.customer.name, parsed.data.customer.phone, parsed.data.customer.city ?? null, parsed.data.customer.address ?? null],
+  )
+  const result = await query(
+    'INSERT INTO conversations (tenant_id, customer_id, channel) VALUES ($1,$2,$3) RETURNING id, channel, status, created_at, updated_at',
+    [request.user!.tenantId, customer.rows[0].id, parsed.data.channel],
+  )
+  return reply.code(201).send({ conversation: result.rows[0] })
+})
+
+app.get('/api/conversations/:id/messages', { preHandler: requireAuth }, async (request, reply) => {
+  const id = (request.params as { id: string }).id
+  const owned = await query('SELECT id FROM conversations WHERE id = $1 AND tenant_id = $2', [id, request.user!.tenantId])
+  if (!owned.rows[0]) return reply.code(404).send({ error: 'Conversation not found' })
+  const result = await query('SELECT id, direction, body, status, created_by, created_at FROM conversation_messages WHERE conversation_id = $1 AND tenant_id = $2 ORDER BY created_at ASC', [id, request.user!.tenantId])
+  return { messages: result.rows }
+})
+
+app.post('/api/conversations/:id/messages', { preHandler: requireAuth }, async (request, reply) => {
+  const parsed = messageSchema.safeParse(request.body)
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid message data' })
+  const id = (request.params as { id: string }).id
+  const owned = await query('SELECT id FROM conversations WHERE id = $1 AND tenant_id = $2', [id, request.user!.tenantId])
+  if (!owned.rows[0]) return reply.code(404).send({ error: 'Conversation not found' })
+  const result = await query(
+    'INSERT INTO conversation_messages (tenant_id, conversation_id, direction, body, status, created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, direction, body, status, created_at',
+    [request.user!.tenantId, id, parsed.data.direction, parsed.data.body, parsed.data.direction === 'outbound' ? 'draft' : parsed.data.status, request.user!.id],
+  )
+  await query('UPDATE conversations SET updated_at = now() WHERE id = $1 AND tenant_id = $2', [id, request.user!.tenantId])
+  return reply.code(201).send({ message: result.rows[0], note: parsed.data.direction === 'outbound' ? 'Outbound message remains a draft until a human approves and an official channel is connected.' : undefined })
 })
 
 app.post('/api/publishing/jobs', { preHandler: requireAuth }, async (request, reply) => {
@@ -365,10 +536,14 @@ app.post('/api/publishing/jobs', { preHandler: requireAuth }, async (request, re
 
 app.setErrorHandler((error, request, reply) => {
   request.log.error(error)
+  if (error instanceof AIProviderError) {
+    return reply.code(error.statusCode).send({ error: error.message })
+  }
   return reply.code(500).send({ error: 'Unexpected server error' })
 })
 
 try {
+  await applyMigration()
   await app.listen({ port: config.API_PORT, host: '0.0.0.0' })
 } catch (error) {
   app.log.error(error)

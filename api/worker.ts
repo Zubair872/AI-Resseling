@@ -4,7 +4,7 @@ import { config } from './config.js'
 import { query } from './db.js'
 import { getContentProvider, type ContentRequest } from './ai.js'
 
-const connection = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null })
+const connection = new Redis(config.REDIS_URL!, { maxRetriesPerRequest: null })
 
 const worker = new Worker('orbitly-workflows', async (job) => {
   const { tenantId, userId, resourceId, payload } = job.data

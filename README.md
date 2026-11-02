@@ -14,22 +14,24 @@ Orbitly is a multi-tenant AI commerce operations platform for product sourcing, 
 
 External supplier, social, payment, and AI provider integrations remain adapter-based and require approved credentials before they are enabled.
 
-## Local development
+AI content defaults to a clearly marked local mock. To enable a real
+OpenAI-compatible provider, set `AI_PROVIDER=openai` and `AI_API_KEY` in the
+server environment only; never expose the key in the frontend or commit it.
 
-1. Copy `.env.example` to `.env`.
-2. Start infrastructure: `docker compose up -d`.
-3. Apply the schema: `npm run db:migrate`.
-4. Start the API: `npm run api:dev`.
-5. In another terminal, start the UI: `npm run dev`.
+## Zero-setup local development
 
-The UI runs on `http://localhost:5173` and the API runs on `http://localhost:4000`.
+Development uses an embedded PGlite database at `.orbitly/local`, an in-memory workflow queue, and an automatically generated persistent JWT secret at `.orbitly/dev-secret`. Docker, PostgreSQL, Redis, Neon, Upstash, and a `.env` file are not required. The API applies migrations automatically at startup.
 
-Set `VITE_API_URL` before building the frontend when the API is hosted elsewhere:
+If an old development `.env` contains `localhost` PostgreSQL or Redis URLs, they are ignored automatically so the embedded database and in-memory queue remain zero-setup. Production and non-local managed URLs are still honored.
+
+Run these two commands in separate terminals:
 
 ```powershell
-$env:VITE_API_URL = "https://api.example.com"
-npm run build
+npm run api:dev
+npm run dev
 ```
+
+The UI runs on `http://localhost:5173` and the API runs on `http://localhost:4000`.
 
 The workspace avatar opens the real login/registration flow. After authentication, the catalog requests tenant-scoped products from the API.
 
@@ -50,12 +52,6 @@ The workspace avatar opens the real login/registration flow. After authenticatio
 - `POST /api/supplier-orders` with a bearer token
 - `POST /api/publishing/jobs` with a bearer token
 
-## Verification
+Build and test scripts remain available in `package.json` for CI and release verification.
 
-```powershell
-npm run build
-npm run api:build
-npm run test:pricing
-```
-
-Production deployment must provide a strong `JWT_SECRET`, managed PostgreSQL, Redis, approved provider credentials, backups, and HTTPS.
+Production can override the embedded defaults by providing `DATABASE_URL`, `REDIS_URL`, and an explicit strong `JWT_SECRET`. Production still requires approved provider credentials, backups, and HTTPS.

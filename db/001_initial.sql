@@ -1,6 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS citext;
-
 CREATE TABLE IF NOT EXISTS tenants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name varchar(100) NOT NULL,
@@ -11,12 +8,24 @@ CREATE TABLE IF NOT EXISTS tenants (
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  email citext UNIQUE NOT NULL,
+  email text UNIQUE NOT NULL,
   password_hash text NOT NULL,
   role varchar(30) NOT NULL DEFAULT 'staff' CHECK (role IN ('super_admin', 'owner', 'admin', 'manager', 'staff', 'support_agent')),
   is_active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS refresh_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  token_hash varchar(64) UNIQUE NOT NULL,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS refresh_sessions_user_idx ON refresh_sessions (user_id, expires_at DESC);
 
 CREATE TABLE IF NOT EXISTS products (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -144,6 +153,31 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
   UNIQUE (tenant_id, order_id, supplier_kind)
 );
 
+CREATE TABLE IF NOT EXISTS conversations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  channel varchar(30) NOT NULL DEFAULT 'manual',
+  status varchar(20) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'pending', 'closed')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS conversations_tenant_updated_idx ON conversations (tenant_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  direction varchar(20) NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+  body text NOT NULL,
+  status varchar(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved', 'sent')),
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS conversation_messages_tenant_created_idx ON conversation_messages (tenant_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS content_drafts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -155,6 +189,10 @@ CREATE TABLE IF NOT EXISTS content_drafts (
   created_by uuid REFERENCES users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE content_drafts
+  ADD COLUMN IF NOT EXISTS reviewed_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS reviewed_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS social_accounts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
