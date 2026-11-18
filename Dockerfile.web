@@ -1,0 +1,15 @@
+# Frontend static build served by nginx. Set the API URL at build time:
+#   docker build -f Dockerfile.web --build-arg VITE_API_URL=https://api.example.com -t orbitly-web .
+FROM node:22-alpine AS build
+WORKDIR /app
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY index.html vite.config.ts tsconfig*.json ./
+COPY src ./src
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80

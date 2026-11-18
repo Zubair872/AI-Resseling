@@ -10,13 +10,16 @@
     "api:dev": "tsx watch api/server.ts",
     "api:start": "node dist-api/api/server.js",
     "api:build": "tsc -p tsconfig.api.json",
-    "test:pricing": "tsx --test tests/pricing.test.ts tests/csv.test.ts tests/ai.test.ts",
+    "test:integration": "tsx --test tests/integration.test.ts",
+    "test:pricing": "tsx --test tests/pricing.test.ts tests/csv.test.ts tests/ai.test.ts tests/rules.test.ts tests/security.test.ts tests/integrations.test.ts tests/chat.test.ts tests/billing.test.ts tests/agents.test.ts tests/autopilot.test.ts tests/providers2.test.ts tests/export.test.ts tests/oauth.test.ts tests/growth.test.ts tests/llmagent.test.ts tests/markaz.test.ts tests/freechannels.test.ts tests/chatorder.test.ts",
     "worker:dev": "tsx watch api/worker.ts",
     "worker:start": "node dist-api/api/worker.js",
-    "db:migrate": "tsx api/migrate.ts"
+    "tunnel": "node scripts/tunnel.js",
+    "db:migrate": "tsx api/migrate.ts",
+    "verify": "npm run api:build && npm run build && npm run test:pricing && npm run test:integration"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.5.14",
+    "@electric-sql/pglite": "^0.5.16",
     "@fastify/cors": "^10.0.1",
     "@fastify/helmet": "^13.0.1",
     "@fastify/rate-limit": "^10.1.0",
@@ -27,7 +30,6 @@
     "fastify": "^5.2.1",
     "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.2",
-    "lucide-react": "^0.468.0",
     "pg": "^8.13.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

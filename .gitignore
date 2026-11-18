@@ -3,4 +3,6 @@ dist
 dist-api
 .env
 .orbitly
-node_modules
+*.log
+*.err
+

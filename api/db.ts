@@ -38,8 +38,9 @@ class EmbeddedPool {
   }
 }
 
-const localDatabasePath = resolve(config.LOCAL_DB_PATH)
-if (!config.DATABASE_URL) await mkdir(dirname(localDatabasePath), { recursive: true })
+const inMemoryDatabase = config.LOCAL_DB_PATH.startsWith('memory://')
+const localDatabasePath = inMemoryDatabase ? config.LOCAL_DB_PATH : resolve(config.LOCAL_DB_PATH)
+if (!config.DATABASE_URL && !inMemoryDatabase) await mkdir(dirname(localDatabasePath), { recursive: true })
 const database = config.DATABASE_URL ? new pg.Pool({ connectionString: config.DATABASE_URL }) : new PGlite(localDatabasePath)
 export const usingEmbeddedDatabase = !config.DATABASE_URL
 export const pool: DatabasePool = config.DATABASE_URL ? database as unknown as DatabasePool : new EmbeddedPool(database as PGlite)

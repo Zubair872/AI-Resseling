@@ -8,7 +8,7 @@ export type ProductImportRow = {
   supplierUrl?: string
 }
 
-function splitCsvLine(line: string) {
+export function splitCsvLine(line: string) {
   const cells: string[] = []
   let cell = ''
   let quoted = false
